@@ -1,0 +1,12 @@
+{
+  "name": "compact",
+  "version": "1.0.0",
+  "description": "Claude session compaction tool with background processing and resume",
+  "bin": {
+    "compact": "./compact.ts"
+  },
+  "type": "module",
+  "keywords": ["claude", "session", "compact", "cli"],
+  "author": "",
+  "license": "MIT"
+}
