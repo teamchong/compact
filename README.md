@@ -16,11 +16,13 @@ bun link
 compact &
 ```
 
-Or during Claude Code session
+During Claude Code session
 
 ```bash
-!compact &
+!compact
 ```
+
+Then press `Ctrl + B` to send it to background
 
 ### Check status
 
