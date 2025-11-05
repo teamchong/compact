@@ -49,10 +49,16 @@ async function firstLine<T>(lines: AsyncIterable<T>): Promise<T | null> {
   return null;
 }
 
+function getHash(): string {
+  return createHash('sha256').update(process.cwd()).digest('hex').slice(0, 16);
+}
+
 function getStateJsonFile(): string {
-  const cwd = process.cwd();
-  const hash = createHash('sha256').update(cwd).digest('hex').slice(0, 16);
-  return `/tmp/compact-${hash}.json`;
+  return `/tmp/compact-${getHash()}.json`;
+}
+
+function getBackupFile(): string {
+  return `/tmp/compact-backup-${getHash()}.jsonl`;
 }
 
 // Main execution
@@ -69,7 +75,7 @@ async function main() {
         process.exit(0);
       }
 
-      const state = await Bun.file(stateFile).json();
+      const state = await Bun.file(stateFile).json() as CompactState;
       console.log('Compaction Status:');
       console.log(`  Status: ${state.status}`);
       console.log(`  Original session: ${state.orgSessionId}`);
@@ -101,16 +107,13 @@ async function main() {
         throw new Error('No compact state found. Nothing to rollback.');
       }
 
-      const state = await Bun.file(stateFile).json();
+      const state = await Bun.file(stateFile).json() as CompactState;
       if (state.status !== 'resumed') {
         throw new Error(`Cannot rollback. Current status: ${state.status}. Only 'resumed' sessions can be rolled back.`);
       }
 
       const { orgJsonlFile } = state;
-
-      const cwd = process.cwd();
-      const hash = createHash('sha256').update(cwd).digest('hex').slice(0, 16);
-      const backupFile = `/tmp/compact-backup-${hash}.jsonl`;
+      const backupFile = getBackupFile();
 
       if (!await Bun.file(backupFile).exists()) {
         throw new Error(`Backup file not found: ${backupFile}`);
@@ -128,6 +131,19 @@ async function main() {
       console.log(`From backup: ${backupFile}`);
       console.log(`\nYou can now run 'compact resume' again if needed.`);
       process.exit(0);
+    }
+
+    // Validate subcommand
+    const subcommand = process.argv[2];
+    if (subcommand && !['status', 'resume', 'rollback'].includes(subcommand)) {
+      console.error(`Unknown command: ${subcommand}\n`);
+      console.log('Usage: compact [command]');
+      console.log('\nCommands:');
+      console.log('  (no args)  Run compaction on current session');
+      console.log('  status     Check compaction status');
+      console.log('  resume     Resume compacted session');
+      console.log('  rollback   Restore from backup after resume');
+      process.exit(1);
     }
 
     const compactStartTime = new Date().toISOString();
@@ -156,7 +172,7 @@ async function main() {
 
     // Save state (mark as in-progress)
     const stateFile = getStateJsonFile();
-    const state = {
+    const state: CompactState = {
       orgSessionId,
       orgJsonlFile,
       forkSessionId,
@@ -164,7 +180,7 @@ async function main() {
       status: 'compacting',
       compactStartTime,
       startTime: new Date().toISOString(),
-      endTime: null as string | null,
+      endTime: null,
     };
     await Bun.write(stateFile, JSON.stringify(state, null, 2));
 
@@ -206,14 +222,14 @@ async function handleMerge() {
     throw new Error(`No compact state found. Run 'compact' first.`);
   }
 
-  let state = await Bun.file(stateFile).json();
+  let state = await Bun.file(stateFile).json() as CompactState;
 
   // Wait for compaction to complete if in progress
   if (state.status === 'compacting') {
     console.log('Compaction in progress, waiting...');
     while (state.status === 'compacting') {
       await new Promise(resolve => setTimeout(resolve, 1000)); // Poll every 1 second
-      state = await Bun.file(stateFile).json();
+      state = await Bun.file(stateFile).json() as CompactState;
     }
     console.log('Compaction complete, proceeding with merge...');
   } else if (state.status === 'resumed') {
@@ -233,26 +249,20 @@ async function handleMerge() {
 
   console.log("\nMerging forked messages with original session...");
 
-  //Read fork jsonl file (reversed, then we'll reverse back)
+  // Read fork jsonl file (reversed, then we'll reverse back)
   const forkLinesArrayRev: JsonLine[] = [];
 
   for await (const line of readLinesReverse(forkJsonlFile)) {
-    if (!line) continue;
-    const json: JsonLine = JSON.parse(line); // No error handling, fail fast and loud
-
+    const json: JsonLine = JSON.parse(line);
     forkLinesArrayRev.push(json);
-
-    // Stop after compact_boundary
     if (json.subtype === "compact_boundary") break;
   }
 
-  //Read original jsonl file - get messages added after forking
+  // Read original jsonl file - get messages added after forking
   let firstNewTimestamp: string = '';
   const newLinesArrayRev: JsonLine[] = [];
 
-  // Read original lines (reversed, then we'll reverse back)
   for await (const line of readLinesReverse(orgJsonlFile)) {
-    if (!line) continue;
     const json: JsonLine = JSON.parse(line.replaceAll(orgSessionId, forkSessionId));
 
     // Stop when we reach messages from before the fork
@@ -299,9 +309,8 @@ async function handleMerge() {
     }
   });
 
-  const newUuidKeys = Object.keys(newUuidMap);
   const replaceNewUuids = (str: string): string => {
-    newUuidKeys.forEach(key => {
+    Object.keys(newUuidMap).forEach(key => {
       str = str.replaceAll(key, newUuidMap[key]);
     });
     return str;
@@ -319,9 +328,7 @@ async function handleMerge() {
   const preCompactLinesCount = orgLinesCount - newLinesArray.length - 1; // -1 for trailing newline
 
   // Backup original file before merge
-  const cwd = process.cwd();
-  const hash = createHash('sha256').update(cwd).digest('hex').slice(0, 16);
-  const backupFile = `/tmp/compact-backup-${hash}.jsonl`;
+  const backupFile = getBackupFile();
   await $`cp ${orgJsonlFile} ${backupFile}`;
   console.log(`Backup saved: ${backupFile}`);
 
@@ -344,6 +351,19 @@ interface JsonLine {
   timestamp?: string;
   subtype?: string;
   [key: string]: unknown;
+}
+
+interface CompactState {
+  orgSessionId: string;
+  orgJsonlFile: string;
+  forkSessionId: string;
+  forkJsonlFile: string;
+  status: 'compacting' | 'ready' | 'resumed';
+  compactStartTime: string;
+  startTime: string;
+  endTime: string | null;
+  resumeTime?: string;
+  rollbackTime?: string;
 }
 
 const FORKED_TMP_JSONL_FILE = `/tmp/claude-forked-${process.pid}.jsonl`;
