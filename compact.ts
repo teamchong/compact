@@ -339,6 +339,12 @@ async function handleMerge() {
 
   await $`head -n ${preCompactLinesCount} ${orgJsonlFile} > ${MERGE_TMP_JSONL_FILE} && cat ${FORKED_TMP_JSONL_FILE} >> ${MERGE_TMP_JSONL_FILE} && rm ${FORKED_TMP_JSONL_FILE} && mv ${MERGE_TMP_JSONL_FILE} ${orgJsonlFile}`;
 
+  // Final cleanup: replace ALL session IDs to fix any corrupted ones from previous failed compactions
+  console.log("Cleaning up session IDs...");
+  const CLEANUP_TMP = `/tmp/claude-cleanup-${process.pid}.jsonl`;
+  await $`sed 's/"sessionId":"[^"]*"/"sessionId":"${orgSessionId}"/g' ${orgJsonlFile} > ${CLEANUP_TMP} && mv ${CLEANUP_TMP} ${orgJsonlFile}`;
+  console.log("✅ Session IDs cleaned");
+
   // Update state to mark as resumed
   state.status = 'resumed';
   state.resumeTime = new Date().toISOString();
