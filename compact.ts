@@ -94,9 +94,45 @@ async function main() {
       process.exit(await proc.exited);
     }
 
+    // Check for rollback subcommand
+    if (process.argv[2] === 'rollback') {
+      const stateFile = getStateJsonFile();
+      if (!await Bun.file(stateFile).exists()) {
+        throw new Error('No compact state found. Nothing to rollback.');
+      }
+
+      const state = await Bun.file(stateFile).json();
+      if (state.status !== 'resumed') {
+        throw new Error(`Cannot rollback. Current status: ${state.status}. Only 'resumed' sessions can be rolled back.`);
+      }
+
+      const { orgJsonlFile } = state;
+
+      const cwd = process.cwd();
+      const hash = createHash('sha256').update(cwd).digest('hex').slice(0, 16);
+      const backupFile = `/tmp/compact-backup-${hash}.jsonl`;
+
+      if (!await Bun.file(backupFile).exists()) {
+        throw new Error(`Backup file not found: ${backupFile}`);
+      }
+
+      await $`mv ${backupFile} ${orgJsonlFile}`;
+
+      // Update state back to ready
+      state.status = 'ready';
+      state.rollbackTime = new Date().toISOString();
+      await Bun.write(stateFile, JSON.stringify(state, null, 2));
+
+      console.log('✅ Rollback complete!');
+      console.log(`Restored: ${orgJsonlFile}`);
+      console.log(`From backup: ${backupFile}`);
+      console.log(`\nYou can now run 'compact resume' again if needed.`);
+      process.exit(0);
+    }
+
     const compactStartTime = new Date().toISOString();
     console.log("Getting current session...");
-    const data = await $`claude -p --output-format json -c '!pwd'`.json();
+    const data = await $`claude -p --output-format json -c '!echo Compact started at ${compactStartTime}'`.json();
     const orgSessionId = data.session_id;
     if (!orgSessionId) throw new Error("Failed to get original session ID");
 
@@ -108,7 +144,7 @@ async function main() {
 
     // Fork session
     console.log("Forking session for compaction...");
-    const forkData = await $`claude -p --output-format json -r ${orgSessionId} --fork-session '!pwd'`.json();
+    const forkData = await $`claude -p --output-format json -r ${orgSessionId} --fork-session '!echo Forked for compaction at ${compactStartTime}'`.json();
     const forkSessionId = forkData.session_id;
     if (!forkSessionId) throw new Error("Failed to fork session for compaction");
 
@@ -180,6 +216,8 @@ async function handleMerge() {
       state = await Bun.file(stateFile).json();
     }
     console.log('Compaction complete, proceeding with merge...');
+  } else if (state.status === 'resumed') {
+    throw new Error(`Already resumed. Run 'compact rollback' first if you want to undo the merge.`);
   } else if (state.status !== 'ready') {
     throw new Error(`Invalid state: ${state.status}. Run 'compact' first.`);
   }
@@ -280,8 +318,22 @@ async function handleMerge() {
   const orgLinesCount = parseInt(await firstLine($`wc -l < ${orgJsonlFile}`.lines()) ?? '0');
   const preCompactLinesCount = orgLinesCount - newLinesArray.length - 1; // -1 for trailing newline
 
+  // Backup original file before merge
+  const cwd = process.cwd();
+  const hash = createHash('sha256').update(cwd).digest('hex').slice(0, 16);
+  const backupFile = `/tmp/compact-backup-${hash}.jsonl`;
+  await $`cp ${orgJsonlFile} ${backupFile}`;
+  console.log(`Backup saved: ${backupFile}`);
+
   await $`head -n ${preCompactLinesCount} ${orgJsonlFile} > ${MERGE_TMP_JSONL_FILE} && cat ${FORKED_TMP_JSONL_FILE} >> ${MERGE_TMP_JSONL_FILE} && rm ${FORKED_TMP_JSONL_FILE} && mv ${MERGE_TMP_JSONL_FILE} ${orgJsonlFile}`;
+
+  // Update state to mark as resumed
+  state.status = 'resumed';
+  state.resumeTime = new Date().toISOString();
+  await Bun.write(stateFile, JSON.stringify(state, null, 2));
+
   console.log("✅ Merge complete!");
+  console.log(`To rollback: compact rollback`);
   return orgSessionId;
 }
 
