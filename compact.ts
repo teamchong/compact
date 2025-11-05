@@ -119,7 +119,12 @@ async function main() {
         throw new Error(`Backup file not found: ${backupFile}`);
       }
 
-      await $`mv ${backupFile} ${orgJsonlFile}`;
+      // Save merged version for debugging
+      const rollbackFile = `/tmp/compact-rollback-${getHash()}.jsonl`;
+      await $`cp ${orgJsonlFile} ${rollbackFile}`;
+      console.log(`Merged version saved: ${rollbackFile}`);
+
+      await $`cp ${backupFile} ${orgJsonlFile}`;
 
       // Update state back to ready
       state.status = 'ready';
@@ -253,7 +258,7 @@ async function handleMerge() {
   const forkLinesArrayRev: JsonLine[] = [];
 
   for await (const line of readLinesReverse(forkJsonlFile)) {
-    const json: JsonLine = JSON.parse(line);
+    const json: JsonLine = JSON.parse(line.replaceAll(forkSessionId, orgSessionId));
     forkLinesArrayRev.push(json);
     if (json.subtype === "compact_boundary") break;
   }
@@ -263,7 +268,7 @@ async function handleMerge() {
   const newLinesArrayRev: JsonLine[] = [];
 
   for await (const line of readLinesReverse(orgJsonlFile)) {
-    const json: JsonLine = JSON.parse(line.replaceAll(orgSessionId, forkSessionId));
+    const json: JsonLine = JSON.parse(line);
 
     // Stop when we reach messages from before the fork
     if (json.timestamp && json.timestamp <= compactStartTime) {
