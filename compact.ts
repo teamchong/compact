@@ -19,15 +19,12 @@ async function* readLinesReverse(filePath: string) {
     const fullText = text + savedFirstLine;
     const lines = fullText.split('\n').reverse();
 
-    let skipLast = false;
     if (startPos > 0 && lines.length > 0) {
       savedFirstLine = lines[lines.length - 1];
-      skipLast = true; // Don't yield incomplete line from chunk boundary
+      lines.pop(); // Skip incomplete line from chunk boundary
     }
 
-    for (let i = 0; i < lines.length; i++) {
-      if (skipLast && i === lines.length - 1) continue; // Skip incomplete line
-      const line = lines[i];
+    for (const line of lines) {
       if (line.trim()) yield line;
     }
 
@@ -37,9 +34,13 @@ async function* readLinesReverse(filePath: string) {
 
 async function cleanup() {
   await Promise.allSettled([
-    unlink(FORKED_TMP_JSONL_FILE),
-    unlink(MERGE_TMP_JSONL_FILE)
+    unlink(FORKED_TMP_JSONL_FILE).catch(() => {}),
+    unlink(MERGE_TMP_JSONL_FILE).catch(() => {})
   ]);
+}
+
+function cleanupSync() {
+  try { Bun.spawn(['rm', '-f', FORKED_TMP_JSONL_FILE, MERGE_TMP_JSONL_FILE]); } catch {}
 }
 
 async function firstLine<T>(lines: AsyncIterable<T>): Promise<T | null> {
@@ -149,7 +150,7 @@ async function main() {
 
     // Validate if it's a GUID (session ID)
     if (arg && isValidGuid(arg)) {
-      sessionIdArg = arg;
+      sessionIdArg = arg.toLowerCase(); // Normalize to lowercase
       console.log(`Using specified session: ${sessionIdArg}`);
     } else if (arg) {
       // Unknown command
@@ -181,8 +182,8 @@ async function main() {
       if (!orgSessionId) throw new Error("Failed to get original session ID");
     }
 
-    const orgJsonlFile = await firstLine($`fd -1utf ${'^' + orgSessionId + '.jsonl$'} ${process.env.HOME + '/.claude/projects'}`.lines());
-    if (!orgJsonlFile) throw new Error("Original JSONL file not found");
+    const orgJsonlFile = await firstLine($`fd -1utf ${'^' + orgSessionId + '.jsonl$'} ${CLAUDE_PROJECTS_DIR}`.lines());
+    if (!orgJsonlFile) throw new Error(`Original JSONL file not found for session ${orgSessionId}`);
 
     console.log(`ORG_SESSION_ID = ${orgSessionId}`);
     console.log(`ORG_JSONL_FILE = ${orgJsonlFile}`);
@@ -193,8 +194,8 @@ async function main() {
     const forkSessionId = forkData.session_id;
     if (!forkSessionId) throw new Error("Failed to fork session for compaction");
 
-    const forkJsonlFile = await firstLine($`fd -1utf ^${forkSessionId}.jsonl$ ${process.env.HOME}/.claude/projects`.lines());
-    if (!forkJsonlFile) throw new Error("Compact JSONL file not found");
+    const forkJsonlFile = await firstLine($`fd -1utf ^${forkSessionId}.jsonl$ ${CLAUDE_PROJECTS_DIR}`.lines());
+    if (!forkJsonlFile) throw new Error(`Compact JSONL file not found for session ${forkSessionId}`);
 
     console.log(`FORK_SESSION_ID = ${forkSessionId}`);
     console.log(`FORK_JSONL_FILE = ${forkJsonlFile}`);
@@ -256,9 +257,14 @@ async function handleMerge() {
   // Wait for compaction to complete if in progress
   if (state.status === 'compacting') {
     console.log('Compaction in progress, waiting...');
-    while (state.status === 'compacting') {
+    let waited = 0;
+    while (state.status === 'compacting' && waited < MAX_COMPACTION_WAIT_SECONDS) {
       await new Promise(resolve => setTimeout(resolve, 1000)); // Poll every 1 second
       state = await Bun.file(stateFile).json() as CompactState;
+      waited++;
+    }
+    if (state.status === 'compacting') {
+      throw new Error(`Compaction timeout after ${MAX_COMPACTION_WAIT_SECONDS}s. Check compact process.`);
     }
     console.log('Compaction complete, proceeding with merge...');
   } else if (state.status === 'resumed') {
@@ -285,6 +291,75 @@ async function handleMerge() {
     const json: JsonLine = JSON.parse(line.replaceAll(forkSessionId, orgSessionId));
     forkLinesArrayRev.push(json);
     if (json.subtype === "compact_boundary") break;
+  }
+
+  // Single pass: collect tool_use IDs, track UUIDs, and identify orphaned tool_results
+  const toolUseIds = new Set<string>();
+  const allUuids = new Set<string>();
+  const uuidToParentMap = new Map<string, string>();
+  const orphanedIndices = new Set<number>();
+
+  forkLinesArrayRev.forEach((line, idx) => {
+    if (line.uuid) allUuids.add(line.uuid);
+    if (line.uuid && line.parentUuid) {
+      uuidToParentMap.set(line.uuid, line.parentUuid);
+    }
+
+    const content = line.message?.content;
+    if (!content || !Array.isArray(content)) return;
+
+    // Collect tool_use IDs
+    content.forEach(c => {
+      if (c.type === 'tool_use' && c.id) {
+        toolUseIds.add(c.id);
+      }
+    });
+  });
+
+  // Second pass: identify orphaned tool_results
+  forkLinesArrayRev.forEach((line, idx) => {
+    const content = line.message?.content;
+    if (!content || !Array.isArray(content)) return;
+
+    const hasOrphanedToolResult = content.some(c =>
+      c.type === 'tool_result' && c.tool_use_id && !toolUseIds.has(c.tool_use_id)
+    );
+
+    if (hasOrphanedToolResult) {
+      console.log(`⚠️  Filtered orphaned tool_result (UUID: ${line.uuid})`);
+      orphanedIndices.add(idx);
+    }
+  });
+
+  // Filter out orphaned messages
+  const validForkLinesArrayRev = forkLinesArrayRev.filter((_, idx) => !orphanedIndices.has(idx));
+
+  // Find filtered UUIDs
+  const remainingUuids = new Set(validForkLinesArrayRev.map(line => line.uuid).filter(Boolean));
+  const filteredUuids = new Set<string>();
+  for (const uuid of allUuids) {
+    if (!remainingUuids.has(uuid)) filteredUuids.add(uuid);
+  }
+
+  // Update the array to use filtered version
+  forkLinesArrayRev.length = 0;
+  forkLinesArrayRev.push(...validForkLinesArrayRev);
+
+  // Fix parent UUID references - if any message references a filtered UUID as parent,
+  // relink it to that filtered message's parent
+  if (filteredUuids.size > 0) {
+    forkLinesArrayRev.forEach(line => {
+      if (line.parentUuid && filteredUuids.has(line.parentUuid)) {
+        // Walk back to find non-filtered parent
+        let newParent = line.parentUuid;
+        while (newParent && filteredUuids.has(newParent)) {
+          newParent = uuidToParentMap.get(newParent) || '';
+        }
+        if (newParent) {
+          line.parentUuid = newParent;
+        }
+      }
+    });
   }
 
   // Read original jsonl file - get messages added after forking
@@ -339,9 +414,9 @@ async function handleMerge() {
   });
 
   const replaceNewUuids = (str: string): string => {
-    Object.keys(newUuidMap).forEach(key => {
-      str = str.replaceAll(key, newUuidMap[key]);
-    });
+    for (const [oldUuid, newUuid] of Object.entries(newUuidMap)) {
+      str = str.replaceAll(oldUuid, newUuid);
+    }
     return str;
   };
 
@@ -349,8 +424,10 @@ async function handleMerge() {
   try {
     forkLinesArray.forEach(line => writer.write(JSON.stringify(line) + '\n'));
     newLinesArray.forEach(line => writer.write(replaceNewUuids(JSON.stringify(line)) + '\n'));
-  } finally {
     await writer.end();
+  } catch (error) {
+    await writer.end();
+    throw error;
   }
 
   const orgLinesCount = parseInt(await firstLine($`wc -l < ${orgJsonlFile}`.lines()) ?? '0');
@@ -373,12 +450,21 @@ async function handleMerge() {
   return orgSessionId;
 }
 
+interface MessageContent {
+  type: string;
+  id?: string;
+  tool_use_id?: string;
+}
+
 interface JsonLine {
   uuid?: string;
   logicalParentUuid?: string;
   parentUuid?: string;
   timestamp?: string;
   subtype?: string;
+  message?: {
+    content?: MessageContent[];
+  };
   [key: string]: unknown;
 }
 
@@ -397,12 +483,17 @@ interface CompactState {
 
 const FORKED_TMP_JSONL_FILE = `/tmp/claude-forked-${process.pid}.jsonl`;
 const MERGE_TMP_JSONL_FILE = `/tmp/claude-merge-${process.pid}.jsonl`;
+const MAX_COMPACTION_WAIT_SECONDS = 600;
+const CLAUDE_PROJECTS_DIR = `${process.env.HOME}/.claude/projects`;
 
 process.on("SIGINT", () => {
-  cleanup();
+  cleanupSync();
   process.exit(130);
 });
-process.on("SIGTERM", cleanup);
-process.on("exit", cleanup);
+process.on("SIGTERM", () => {
+  cleanupSync();
+  process.exit(143);
+});
+process.on("exit", cleanupSync);
 
 main();
