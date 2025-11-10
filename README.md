@@ -10,19 +10,17 @@ bun link
 
 ## Usage
 
-### Run compaction
+### Run compaction on current session
 
 ```bash
-compact &
+compact
 ```
 
-During Claude Code session
+### Run compaction on specific session
 
 ```bash
-!compact
+compact <session-id>
 ```
-
-Then press `Ctrl + B` to send it to background
 
 ### Check status
 

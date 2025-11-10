@@ -61,6 +61,11 @@ function getBackupFile(): string {
   return `/tmp/compact-backup-${getHash()}.jsonl`;
 }
 
+function isValidGuid(str: string): boolean {
+  const guidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  return guidRegex.test(str);
+}
+
 // Main execution
 async function main() {
   try {
@@ -138,24 +143,43 @@ async function main() {
       process.exit(0);
     }
 
-    // Validate subcommand
-    const subcommand = process.argv[2];
-    if (subcommand && !['status', 'resume', 'rollback'].includes(subcommand)) {
-      console.error(`Unknown command: ${subcommand}\n`);
-      console.log('Usage: compact [command]');
+    // Check if session ID provided as argument
+    const arg = process.argv[2];
+    let sessionIdArg: string | undefined;
+
+    // Validate if it's a GUID (session ID)
+    if (arg && isValidGuid(arg)) {
+      sessionIdArg = arg;
+      console.log(`Using specified session: ${sessionIdArg}`);
+    } else if (arg) {
+      // Unknown command
+      console.error(`Unknown command: ${arg}\n`);
+      console.log('Usage: compact [session-id | command]');
       console.log('\nCommands:');
-      console.log('  (no args)  Run compaction on current session');
-      console.log('  status     Check compaction status');
-      console.log('  resume     Resume compacted session');
-      console.log('  rollback   Restore from backup after resume');
+      console.log('  (no args)         Run compaction on current session');
+      console.log('  <session-id>      Run compaction on specific session');
+      console.log('  status            Check compaction status');
+      console.log('  resume            Resume compacted session');
+      console.log('  rollback          Restore from backup after resume');
       process.exit(1);
     }
 
     const compactStartTime = new Date().toISOString();
-    console.log("Getting current session...");
-    const data = await $`claude -p --output-format json -c '!echo Compact started at ${compactStartTime}'`.json();
-    const orgSessionId = data.session_id;
-    if (!orgSessionId) throw new Error("Failed to get original session ID");
+
+    let orgSessionId: string;
+    if (sessionIdArg) {
+      // Use the specified session ID with -r
+      console.log("Using specified session...");
+      const data = await $`claude -p --output-format json -r ${sessionIdArg} '!echo Compact started at ${compactStartTime}'`.json();
+      orgSessionId = data.session_id;
+      if (!orgSessionId) throw new Error("Failed to get session ID");
+    } else {
+      // Use current session with -c
+      console.log("Getting current session...");
+      const data = await $`claude -p --output-format json -c '!echo Compact started at ${compactStartTime}'`.json();
+      orgSessionId = data.session_id;
+      if (!orgSessionId) throw new Error("Failed to get original session ID");
+    }
 
     const orgJsonlFile = await firstLine($`fd -1utf ${'^' + orgSessionId + '.jsonl$'} ${process.env.HOME + '/.claude/projects'}`.lines());
     if (!orgJsonlFile) throw new Error("Original JSONL file not found");
