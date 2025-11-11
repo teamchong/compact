@@ -383,6 +383,66 @@ async function handleMerge() {
   }
   const newLinesArray = newLinesArrayRev.toReversed(); // Restore original order
 
+  // Build parent map for new messages (same pattern as fork messages)
+  const newUuidToParentMap = new Map<string, string>();
+  newLinesArray.forEach(line => {
+    if (line.uuid && line.parentUuid) {
+      newUuidToParentMap.set(line.uuid, line.parentUuid);
+    }
+  });
+
+  // Collect tool_use IDs from NEW messages only
+  const newToolUseIds = new Set<string>();
+  newLinesArray.forEach(line => {
+    const content = line.message?.content;
+    if (content && Array.isArray(content)) {
+      content.forEach(c => {
+        if (c.type === 'tool_use' && c.id) {
+          newToolUseIds.add(c.id);
+        }
+      });
+    }
+  });
+
+  // Filter tool_results from new messages that don't have tool_use in NEW messages
+  // This catches: 1) truly orphaned tool_results, 2) tool_results referencing pre-fork tool_uses (separated by fork boundary)
+  const newOrphanedUuids = new Set<string>();
+  const validNewLines = newLinesArray.filter((line, idx) => {
+    const content = line.message?.content;
+    if (!content || !Array.isArray(content)) return true;
+
+    const hasUnmatchedToolResult = content.some(c =>
+      c.type === 'tool_result' && c.tool_use_id && !newToolUseIds.has(c.tool_use_id)
+    );
+
+    if (hasUnmatchedToolResult) {
+      console.log(`⚠️  Filtered unmatched tool_result from new messages (UUID: ${line.uuid}, tool_use_id: ${content.find(c => c.type === 'tool_result')?.tool_use_id})`);
+      if (line.uuid) newOrphanedUuids.add(line.uuid);
+      return false;
+    }
+    return true;
+  });
+
+  // Fix parent references in new messages (same pattern as fork messages)
+  if (newOrphanedUuids.size > 0) {
+    validNewLines.forEach(line => {
+      if (line.parentUuid && newOrphanedUuids.has(line.parentUuid)) {
+        // Walk back to find non-filtered parent
+        let newParent = line.parentUuid;
+        while (newParent && newOrphanedUuids.has(newParent)) {
+          newParent = newUuidToParentMap.get(newParent) || '';
+        }
+        if (newParent) {
+          line.parentUuid = newParent;
+        }
+      }
+    });
+  }
+
+  // Replace newLinesArray with filtered version
+  newLinesArray.length = 0;
+  newLinesArray.push(...validNewLines);
+
   // Make sure fork timestamps are in order
   if (firstNewTimestamp) {
     forkLinesArrayRev.forEach(json => {
