@@ -67,6 +67,52 @@ function isValidGuid(str: string): boolean {
   return guidRegex.test(str);
 }
 
+function sanitizePath(path: string): string {
+  return path.replace(/[^a-zA-Z0-9]/g, '-');
+}
+
+async function getCurrentSessionId(): Promise<string> {
+  const cwd = process.cwd();
+  const sanitized = sanitizePath(cwd);
+  const projectDir = `${process.env.HOME}/.claude/projects/${sanitized}`;
+
+  // Get all GUID pattern JSONL files
+  const guidRegex = /^.*\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/;
+  const sessions: Array<{ sessionId: string; timestamp: string }> = [];
+
+  for await (const line of $`ls ${projectDir}/*.jsonl`.lines()) {
+    const match = line.match(guidRegex);
+    if (!match) continue;
+
+    const sessionId = match[1];
+    const file = Bun.file(line);
+    if (file.size === 0) continue;
+
+    // Read last line to get last message timestamp
+    const lastLine = await firstLine(readLinesReverse(line));
+    if (!lastLine) continue;
+
+    try {
+      const json = JSON.parse(lastLine);
+      if (json.timestamp) {
+        sessions.push({ sessionId, timestamp: json.timestamp });
+      }
+    } catch {
+      // Skip invalid JSON
+    }
+  }
+
+  if (sessions.length === 0) {
+    throw new Error(`No valid sessions found in ${projectDir}`);
+  }
+
+  // Sort by timestamp descending (newest first)
+  sessions.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+
+  return sessions[0].sessionId;
+}
+
+
 // Main execution
 async function main() {
   try {
@@ -169,19 +215,16 @@ async function main() {
 
     let orgSessionId: string;
     if (sessionIdArg) {
-      // Use the specified session ID with -r
+      // Use the specified session ID directly
       console.log("Using specified session...");
-      const data = await $`claude -p --output-format json -r ${sessionIdArg} '!echo Compact started at ${compactStartTime}'`.json();
-      orgSessionId = data.session_id;
-      if (!orgSessionId) throw new Error("Failed to get session ID");
+      orgSessionId = sessionIdArg;
     } else {
-      // Use current session with -c
+      // Get current session using fd
       console.log("Getting current session...");
-      const data = await $`claude -p --output-format json -c '!echo Compact started at ${compactStartTime}'`.json();
-      orgSessionId = data.session_id;
-      if (!orgSessionId) throw new Error("Failed to get original session ID");
+      orgSessionId = await getCurrentSessionId();
     }
 
+    // Find JSONL file using fd
     const orgJsonlFile = await firstLine($`fd -1utf ${'^' + orgSessionId + '.jsonl$'} ${CLAUDE_PROJECTS_DIR}`.lines());
     if (!orgJsonlFile) throw new Error(`Original JSONL file not found for session ${orgSessionId}`);
 
