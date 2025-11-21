@@ -201,14 +201,41 @@ async function main() {
     } else if (arg) {
       // Unknown command
       console.error(`Unknown command: ${arg}\n`);
-      console.log('Usage: compact [session-id | command]');
+      console.log('Usage: compact [session-id | command] [--force]');
       console.log('\nCommands:');
       console.log('  (no args)         Run compaction on current session');
       console.log('  <session-id>      Run compaction on specific session');
       console.log('  status            Check compaction status');
       console.log('  resume            Resume compacted session');
       console.log('  rollback          Restore from backup after resume');
+      console.log('\nFlags:');
+      console.log('  --force           Skip confirmation if ready compaction exists');
       process.exit(1);
+    }
+
+    // Check if there's an existing ready compaction
+    const stateFile = getStateJsonFile();
+    const forceOverride = process.env.COMPACT_FORCE === '1' || process.argv.includes('--force');
+
+    if (!forceOverride && await Bun.file(stateFile).exists()) {
+      const existingState = await Bun.file(stateFile).json() as CompactState;
+      if (existingState.status === 'ready') {
+        console.log('\n⚠️  WARNING: An existing compaction is ready to resume!');
+        console.log(`   Fork session: ${existingState.forkSessionId}`);
+        console.log(`   Completed: ${existingState.endTime}`);
+        console.log('\n   Running a new compaction will discard this ready session.');
+        process.stdout.write('\n   Continue anyway? (y/N): ');
+
+        for await (const line of console) {
+          const answer = line.trim().toLowerCase();
+          if (answer !== 'y' && answer !== 'yes') {
+            console.log('\nCancelled. Use "compact resume" to resume the existing session.');
+            process.exit(0);
+          }
+          break;
+        }
+        console.log('');
+      }
     }
 
     const compactStartTime = new Date().toISOString();
@@ -276,7 +303,6 @@ async function main() {
     console.log(`FORK_JSONL_FILE = ${forkJsonlFile}`);
 
     // Save state (mark as in-progress)
-    const stateFile = getStateJsonFile();
     const state: CompactState = {
       orgSessionId,
       orgJsonlFile,
