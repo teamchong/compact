@@ -226,13 +226,24 @@ async function main() {
         console.log('\n   Running a new compaction will discard this ready session.');
         process.stdout.write('\n   Continue anyway? (y/N): ');
 
-        for await (const line of console) {
-          const answer = line.trim().toLowerCase();
-          if (answer !== 'y' && answer !== 'yes') {
-            console.log('\nCancelled. Use "compact resume" to resume the existing session.');
-            process.exit(0);
-          }
-          break;
+        // Read single character without waiting for Enter
+        process.stdin.setRawMode(true);
+        process.stdin.resume();
+
+        const answer = await new Promise<string>((resolve) => {
+          process.stdin.once('data', (data) => {
+            const char = data.toString().toLowerCase();
+            resolve(char);
+          });
+        });
+
+        process.stdin.setRawMode(false);
+        process.stdin.pause();
+        console.log(answer); // Echo the character
+
+        if (answer !== 'y') {
+          console.log('\nCancelled. Use "compact resume" to resume the existing session.');
+          process.exit(0);
         }
         console.log('');
       }
