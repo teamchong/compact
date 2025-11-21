@@ -231,16 +231,48 @@ async function main() {
     console.log(`ORG_SESSION_ID = ${orgSessionId}`);
     console.log(`ORG_JSONL_FILE = ${orgJsonlFile}`);
 
-    // Fork session
-    console.log("Forking session for compaction...");
-    const forkData = await $`claude -p --output-format json -r ${orgSessionId} --fork-session '!echo Forked for compaction at ${compactStartTime}'`.json();
-    const forkSessionId = forkData.session_id;
-    if (!forkSessionId) throw new Error("Failed to fork session for compaction");
+    // Fork session and run /compact in single call
+    console.log("Forking session and running /compact...");
+    const proc = Bun.spawn(['bash', '-c', `echo '{"type":"user","message":{"role":"user","content":"/compact"}}' | claude -p --verbose --input-format stream-json --output-format stream-json -r ${orgSessionId} --fork-session`], {
+      stdout: 'pipe',
+      stderr: 'inherit'
+    });
 
+    // Read first line to get session ID immediately
+    const reader = proc.stdout.getReader();
+    let buffer = '';
+    let forkSessionId = '';
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffer += new TextDecoder().decode(value);
+      const newlineIndex = buffer.indexOf('\n');
+
+      if (newlineIndex !== -1) {
+        const firstLine = buffer.slice(0, newlineIndex);
+        try {
+          const initEvent = JSON.parse(firstLine);
+          if (initEvent.type === 'system' && initEvent.subtype === 'init') {
+            forkSessionId = initEvent.session_id;
+            break;
+          }
+        } catch (e) {
+          // Not valid JSON, continue reading
+        }
+        buffer = buffer.slice(newlineIndex + 1);
+      }
+    }
+
+    if (!forkSessionId) throw new Error("Failed to get fork session ID from stream");
+
+    console.log(`FORK_SESSION_ID = ${forkSessionId}`);
+
+    // Find JSONL file
     const forkJsonlFile = await firstLine($`fd -1utf ^${forkSessionId}.jsonl$ ${CLAUDE_PROJECTS_DIR}`.lines());
     if (!forkJsonlFile) throw new Error(`Compact JSONL file not found for session ${forkSessionId}`);
 
-    console.log(`FORK_SESSION_ID = ${forkSessionId}`);
     console.log(`FORK_JSONL_FILE = ${forkJsonlFile}`);
 
     // Save state (mark as in-progress)
@@ -257,10 +289,17 @@ async function main() {
     };
     await Bun.write(stateFile, JSON.stringify(state, null, 2));
 
-    // Run /compact in the forked session
-    console.log("Running /compact...\n");
-    const compactResult = await $`claude -p -r ${forkSessionId} '/compact'`;
-    if (compactResult.exitCode !== 0) throw new Error(`Compact failed with exit code ${compactResult.exitCode}`);
+    // Wait for /compact to complete
+    console.log("Waiting for /compact to complete...\n");
+
+    // Continue reading rest of stream (discard but keep process alive)
+    while (true) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+
+    const exitCode = await proc.exited;
+    if (exitCode !== 0) throw new Error(`Compact failed with exit code ${exitCode}`);
 
     // Update state to mark as complete
     state.status = 'ready';
