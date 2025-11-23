@@ -143,8 +143,17 @@ async function main() {
     // Check for resume subcommand
     if (process.argv[2] === 'resume') {
       const orgSessionId = await handleMerge();
+
+      // Collect any additional arguments to pass through to claude
+      const additionalArgs = process.argv.slice(3);
+
+      const claudeArgs = ['-r', orgSessionId, ...additionalArgs];
       console.log(`Resuming original session ${orgSessionId}...`);
-      const proc = Bun.spawn(['claude', '-r', orgSessionId], {
+      if (additionalArgs.length > 0) {
+        console.log(`With additional args: ${additionalArgs.join(' ')}`);
+      }
+
+      const proc = Bun.spawn(['claude', ...claudeArgs], {
         stdin: 'inherit',
         stdout: 'inherit',
         stderr: 'inherit',
@@ -206,7 +215,7 @@ async function main() {
       console.log('  (no args)         Run compaction on current session');
       console.log('  <session-id>      Run compaction on specific session');
       console.log('  status            Check compaction status');
-      console.log('  resume            Resume compacted session');
+      console.log('  resume [args...]  Resume compacted session (args passed to claude)');
       console.log('  rollback          Restore from backup after resume');
       console.log('\nFlags:');
       console.log('  --force           Skip confirmation if ready compaction exists');
