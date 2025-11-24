@@ -279,8 +279,12 @@ async function main() {
     console.log(`ORG_JSONL_FILE = ${orgJsonlFile}`);
 
     // Fork session and run /compact in single call
+    // Default to haiku unless user specified --model
+    const hasModelArg = process.argv.some(arg => arg === '--model' || arg.startsWith('--model='));
+    const modelArg = hasModelArg ? '' : ' --model haiku';
+
     console.log("Forking session and running /compact...");
-    const proc = Bun.spawn(['bash', '-c', `echo '{"type":"user","message":{"role":"user","content":"/compact"}}' | claude -p --verbose --input-format stream-json --output-format stream-json -r ${orgSessionId} --fork-session`], {
+    const proc = Bun.spawn(['bash', '-c', `echo '{"type":"user","message":{"role":"user","content":"/compact"}}' | claude -p --verbose --input-format stream-json --output-format stream-json -r ${orgSessionId} --fork-session${modelArg}`], {
       stdout: 'pipe',
       stderr: 'inherit'
     });
